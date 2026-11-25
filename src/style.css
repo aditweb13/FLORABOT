@@ -88,6 +88,19 @@
 .prompt-pill-btn:hover{background:#edf5ec;border-color:#bcd6c0;color:#1b4a2e}
 .chat-input-bar{padding:14px 20px;border-top:1px solid #edf2ec;display:flex;gap:9px;background:#fff}
 
+/* Keep assistant responses inside the chat pane even when references contain long text. */
+.full-chat-wrapper{grid-template-columns:260px minmax(0,1fr);min-width:0}
+.chat-main-area{min-width:0;min-height:0}
+.chat-main-header{min-width:0;gap:12px;flex-wrap:wrap}
+.chat-main-header>div:last-child{min-width:0;max-width:100%;flex-wrap:wrap}
+.chat-context-select{min-width:0;max-width:100%}
+.chat-messages-container{min-width:0}
+.chat-message{min-width:0;max-width:100%}
+.chat-message>div:last-child{min-width:0;max-width:100%;overflow-wrap:anywhere;word-break:break-word}
+@media(max-width:760px){.full-chat-wrapper{grid-template-columns:minmax(0,1fr);min-width:0}.chat-main-header>div:last-child{width:100%;justify-content:space-between}.chat-context-select{flex:1}.chat-message{max-width:100%}.chat-messages-container{padding:14px}.chat-input-bar{padding:12px}}
+.diagnostic-error{display:grid;gap:4px;margin:10px 0;padding:10px 12px;border:1px solid #f2d3bd;border-radius:8px;background:#fff8f2;color:#82523a;font-size:10px;line-height:1.5;overflow-wrap:anywhere}
+.diagnostic-error b{color:#704126}
+
 /* Knowledge Library Cards */
 .knowledge-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:16px}
 .k-card{background:#fff;border:1px solid #e6eee5;border-radius:13px;padding:18px;display:flex;flex-direction:column;justify-content:space-between;box-shadow:0 3px 10px #1a382604}
@@ -129,4 +142,90 @@
   .full-chat-wrapper{grid-template-columns:1fr}
   .chat-convo-sidebar{display:none}
   .compare-container{grid-template-columns:1fr}
+}
+
+/* Scaled vector annotations share the image object-fit:contain coordinate frame. */
+.result-image .detection-overlay{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+
+/* ==========================================================================
+   WCAG 2.1 AA ACCESSIBILITY & MOBILE RESPONSIVENESS ENHANCEMENTS
+   ========================================================================== */
+
+/* 1. Visible Focus Indicators (Keyboard navigation compliance) */
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid #1f6944 !important;
+  outline-offset: 2px !important;
+  box-shadow: 0 0 0 4px rgba(31, 105, 68, 0.2) !important;
+}
+
+/* 2. Enhanced Accessible Color Contrast */
+.workspace-label, .eyebrow {
+  color: #526359 !important; /* Enhanced from low-contrast #829389 */
+}
+
+.breadcrumbs {
+  color: #4b5f53 !important;
+}
+
+.text-link {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.text-link:hover, .text-link:focus-visible {
+  color: #124329 !important;
+  text-decoration-thickness: 2px;
+}
+
+/* 3. Screen Reader Utility Class */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border-width: 0;
+}
+
+/* 4. Touch Targets & Mobile Ergonomics */
+@media (max-width: 768px) {
+  button, .btn, .nav-item, .filter-pill {
+    min-height: 44px; /* Minimum WCAG touch target height */
+  }
+
+  .nav-item {
+    font-size: 14px;
+  }
+
+  .chat-fab {
+    width: 56px;
+    height: 56px;
+  }
+
+  .modal {
+    width: 95vw;
+    margin: 10px auto;
+    padding: 18px 14px;
+  }
+
+  .plant-card-copy h3 {
+    font-size: 15px;
+  }
+}
+
+/* 5. Reduced Motion Compliance */
+@media (prefers-reduced-motion: reduce) {
+  *, ::before, ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

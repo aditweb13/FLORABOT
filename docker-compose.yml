@@ -1,0 +1,29 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: florabot-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend/data:/app/data
+      - ./backend/florabot.db:/app/florabot.db
+    env_file:
+      - ./backend/.env
+    environment:
+      - DATABASE_URL=sqlite:///./florabot.db
+      - UPLOAD_DIR=./data/uploads
+      - REPORT_DIR=./data/reports
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: florabot-frontend
+    restart: unless-stopped
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend

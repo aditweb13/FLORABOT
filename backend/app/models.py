@@ -21,6 +21,8 @@ class Plant(Base):
     soil_type: Mapped[str] = mapped_column(String(80), default="Potting Mix")
     watering_frequency_days: Mapped[int] = mapped_column(Integer, default=7)
     
+    # Sensor Telemetry relationship
+    telemetry: Mapped[list["SensorTelemetry"]] = relationship(back_populates="plant", cascade="all, delete-orphan")
     analyses: Mapped[list["Analysis"]] = relationship(back_populates="plant", cascade="all, delete-orphan")
     reports: Mapped[list["Report"]] = relationship(back_populates="plant", cascade="all, delete-orphan")
     camera_images: Mapped[list["CameraImage"]] = relationship(back_populates="plant")
@@ -43,7 +45,23 @@ class Device(Base):
     
     images: Mapped[list["CameraImage"]] = relationship(back_populates="device", cascade="all, delete-orphan")
     analyses: Mapped[list["Analysis"]] = relationship(back_populates="device")
+    telemetry: Mapped[list["SensorTelemetry"]] = relationship(back_populates="device", cascade="all, delete-orphan")
     logs: Mapped[list["DeviceLog"]] = relationship(back_populates="device", cascade="all, delete-orphan")
+
+class SensorTelemetry(Base):
+    __tablename__ = "sensor_telemetry"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    device_id: Mapped[int | None] = mapped_column(ForeignKey("devices.id"), nullable=True, index=True)
+    plant_id: Mapped[int | None] = mapped_column(ForeignKey("plants.id"), nullable=True, index=True)
+    soil_moisture_pct: Mapped[float | None] = mapped_column(Float, nullable=True) # Calibrated volumetric %
+    raw_adc: Mapped[int | None] = mapped_column(Integer, nullable=True)          # Raw 12-bit ADC reading
+    ambient_temp_c: Mapped[float | None] = mapped_column(Float, nullable=True)     # Ambient Temp °C
+    humidity_pct: Mapped[float | None] = mapped_column(Float, nullable=True)       # Ambient RH %
+    substrate: Mapped[str] = mapped_column(String(80), default="Potting Mix")     # Substrate calibration profile
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, index=True)
+
+    device: Mapped[Device | None] = relationship(back_populates="telemetry")
+    plant: Mapped[Plant | None] = relationship(back_populates="telemetry")
 
 class DeviceLog(Base):
     __tablename__ = "device_logs"
@@ -107,6 +125,11 @@ class Analysis(Base):
     # Diagnostics provider
     provider_engine: Mapped[str] = mapped_column(String(80), default="FloraBOT Vision Engine")
     provider_reference: Mapped[str] = mapped_column(String(200), default="")
+    diagnostic_error: Mapped[str] = mapped_column(Text, default="")
+    detection_data_json: Mapped[str] = mapped_column(Text, default="[]")
+    detection_model_json: Mapped[str] = mapped_column(Text, default="{}")
+    identification_candidates_json: Mapped[str] = mapped_column(Text, default="[]")
+    annotated_image_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
     
     plant: Mapped[Plant] = relationship(back_populates="analyses")
     device: Mapped[Device | None] = relationship(back_populates="analyses")
@@ -160,4 +183,31 @@ class KnowledgeEntry(Base):
     prevention_tips: Mapped[str] = mapped_column(Text, default="")
     source_name: Mapped[str] = mapped_column(String(160), default="FloraBOT Botanical Reference Library")
     source_url: Mapped[str] = mapped_column(String(300), default="")
+    citations: Mapped[str] = mapped_column(Text, default="")
+    review_date: Mapped[str] = mapped_column(String(40), default="")
+    reviewed_by: Mapped[str] = mapped_column(String(160), default="")
+    embedding_json: Mapped[str] = mapped_column(Text, default="[]")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    username: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    email: Mapped[str] = mapped_column(String(160), unique=True, index=True)
+    hashed_password: Mapped[str] = mapped_column(String(255))
+    full_name: Mapped[str] = mapped_column(String(160), default="")
+    role: Mapped[str] = mapped_column(String(40), default="operator")  # admin, operator, viewer
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    api_key: Mapped[str | None] = mapped_column(String(120), nullable=True, unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    last_login: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, index=True)
+    actor_username: Mapped[str] = mapped_column(String(80), default="system", index=True)
+    action: Mapped[str] = mapped_column(String(100), index=True)
+    resource: Mapped[str] = mapped_column(String(120), default="")
+    details_json: Mapped[str] = mapped_column(Text, default="{}")
+    ip_address: Mapped[str] = mapped_column(String(60), default="")

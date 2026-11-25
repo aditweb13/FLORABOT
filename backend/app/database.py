@@ -17,7 +17,16 @@ if url.startswith("sqlite"):
         db_path.parent.mkdir(parents=True, exist_ok=True)
 
 connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {}
-engine = create_engine(url, connect_args=connect_args)
+engine_kwargs = {"connect_args": connect_args}
+if url.startswith(("postgresql", "postgres")):
+    engine_kwargs.update({
+        "pool_size": 10,
+        "max_overflow": 20,
+        "pool_pre_ping": True,
+        "pool_recycle": 300
+    })
+
+engine = create_engine(url, **engine_kwargs)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 class Base(DeclarativeBase):

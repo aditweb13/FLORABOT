@@ -1,18 +1,22 @@
+import asyncio
+import inspect
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 from typing import List, Optional
 import httpx
 from fastapi import FastAPI, BackgroundTasks, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from . import models
 from .config import settings
 from .database import Base, engine, get_db
-from .vision_engine import validate_image_bytes, save_validated_image, analyze_plant_image
+from .vision_engine import validate_image_bytes, save_validated_image, analyze_plant_image, render_detection_overlay
 from .watering_engine import calculate_watering_recommendation
 from .knowledge_service import seed_knowledge_base, search_knowledge, retrieve_context_for_analysis
 from .agent_service import generate_agent_report_data, generate_chat_reply
@@ -21,18 +25,35 @@ from .camera_service import (
     record_received_camera_image
 )
 from .pdf_service import build_pdf_report
+from .auth import (
+    hash_password, verify_password, create_access_token, decode_access_token,
+    generate_api_key, get_current_user, require_role, verify_device_api_key, log_audit_event
+)
+from .monitoring import ProductionSecurityMiddleware, metrics_registry
 
 # Ensure directories & database tables exist
 Path(settings.upload_dir).mkdir(parents=True, exist_ok=True)
 Path(settings.report_dir).mkdir(parents=True, exist_ok=True)
 Base.metadata.create_all(bind=engine)
+# Forward-compatible SQLite additions for existing databases (create_all does not add columns).
+if engine.url.get_backend_name() == "sqlite":
+    with engine.begin() as conn:
+        cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(analyses)")}
+        if "detection_data_json" not in cols:
+            conn.exec_driver_sql("ALTER TABLE analyses ADD COLUMN detection_data_json TEXT NOT NULL DEFAULT '[]'")
+        if "identification_candidates_json" not in cols:
+            conn.exec_driver_sql("ALTER TABLE analyses ADD COLUMN identification_candidates_json TEXT NOT NULL DEFAULT '[]'")
+        if "detection_model_json" not in cols:
+            conn.exec_driver_sql("ALTER TABLE analyses ADD COLUMN detection_model_json TEXT NOT NULL DEFAULT '{}'")
+        if "annotated_image_path" not in cols:
+            conn.exec_driver_sql("ALTER TABLE analyses ADD COLUMN annotated_image_path TEXT")
+        if "diagnostic_error" not in cols:
+            conn.exec_driver_sql("ALTER TABLE analyses ADD COLUMN diagnostic_error TEXT NOT NULL DEFAULT ''")
 
 # Seed knowledge base
 with engine.connect() as conn:
     with Session(bind=conn) as init_db:
         seed_knowledge_base(init_db)
-        # Ensure default device exists
-        get_or_create_device(init_db, identifier="esp32-cam-01", name="ESP32-CAM Indoor Monitor")
 
 app = FastAPI(title="FloraBOT AI API", version="2.0.0", description="Intelligent Indoor Plant Monitoring & Diagnostic API")
 
@@ -40,6 +61,7 @@ cors_origins = [x.strip() for x in settings.cors_origins.split(",") if x.strip()
 if "*" not in cors_origins and not cors_origins:
     cors_origins = ["*"]
 
+app.add_middleware(ProductionSecurityMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
@@ -82,6 +104,11 @@ def serialize_analysis(a: models.Analysis) -> dict:
         "watering_instructions": a.watering_instructions,
         "provider_engine": a.provider_engine,
         "provider_reference": a.provider_reference,
+        "detections": json.loads(a.detection_data_json or "[]"),
+        "detection_model": json.loads(a.detection_model_json or "{}"),
+        "identification_candidates": json.loads(a.identification_candidates_json or "[]"),
+        "original_image": image_url(a.image),
+        "annotated_image": image_url(a.annotated_image_path),
         "plant_name": a.plant.name if a.plant else "Unknown Plant"
     }
 
@@ -119,14 +146,51 @@ def serialize_plant(p: models.Plant, detail: bool = False) -> dict:
 
 def execute_plant_analysis_pipeline(
     db: Session,
-    plant: models.Plant,
+    plant: Optional[models.Plant],
     image_path: str,
     device: Optional[models.Device] = None,
     cam_img: Optional[models.CameraImage] = None
 ) -> models.Analysis:
     """Core image processing, computer vision, watering engine, and report pipeline."""
     # 1. Vision & Disease Analysis
-    vis_res = analyze_plant_image(image_path, plant_hint=plant.species)
+    vis_res = analyze_plant_image(image_path, plant_hint=plant.species if plant else None)
+    # Attach to a recent observation from the same physical camera only when the
+    # identity agrees; otherwise discover a new plant rather than merging by species.
+    if plant is None and device:
+        prior = db.query(models.CameraImage).filter(
+            models.CameraImage.device_id == device.id,
+            models.CameraImage.plant_id.isnot(None)
+        ).order_by(models.CameraImage.timestamp.desc()).first()
+        identified = (vis_res.get("plant_identification") or "").strip().casefold()
+        if prior and prior.plant and identified and identified not in {"unknown", "unknown plant"}:
+            prior_species = (prior.plant.species or "").strip().casefold()
+            if prior_species == identified:
+                plant = prior.plant
+    if plant is None:
+        identified = vis_res.get("plant_identification") or "Unknown Plant"
+        plant = models.Plant(
+            name=f"Discovered Plant {datetime.now().strftime('%Y%m%d-%H%M%S')}",
+            species=identified,
+            category="Houseplant",
+            health_status="Unscanned",
+            image=image_url(image_path),
+        )
+        db.add(plant)
+        db.flush()
+        if cam_img:
+            cam_img.plant_id = plant.id
+
+    annotated_path = None
+    if vis_res.get("detections"):
+        try:
+            annotated_name = f"{Path(image_path).stem}-annotated.jpg"
+            annotated_path = render_detection_overlay(
+                image_path,
+                vis_res["detections"],
+                str(Path(settings.upload_dir) / annotated_name),
+            )
+        except Exception as exc:
+            print(f"Could not create derived annotated image: {type(exc).__name__}: {exc}")
 
     # 2. Watering Recommendation Engine
     water_res = calculate_watering_recommendation(
@@ -163,7 +227,12 @@ def execute_plant_analysis_pipeline(
         watering_reason=water_res.get("watering_reason", ""),
         watering_instructions=water_res.get("watering_instructions", ""),
         provider_engine=vis_res.get("provider_engine", "FloraBOT Vision Engine"),
-        provider_reference=vis_res.get("provider_reference", "")
+        provider_reference=vis_res.get("provider_reference", ""),
+        diagnostic_error=vis_res.get("diagnostic_error", ""),
+        detection_data_json=json.dumps(vis_res.get("detections", [])),
+        detection_model_json=json.dumps(vis_res.get("model_metadata", {})),
+        identification_candidates_json=json.dumps(vis_res.get("identification_candidates", [])),
+        annotated_image_path=annotated_path
     )
     db.add(analysis)
 
@@ -222,6 +291,134 @@ def get_file(filename: str):
 # -------------------------------------------------------------
 # System & Status Endpoints
 # -------------------------------------------------------------
+class UserRegisterRequest(BaseModel):
+    username: str
+    email: str
+    password: str
+    full_name: Optional[str] = ""
+    role: Optional[str] = "operator"
+
+class UserLoginRequest(BaseModel):
+    username: str
+    password: str
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in_minutes: int
+    user_id: int
+    username: str
+    role: str
+
+class UserResponse(BaseModel):
+    id: int
+    username: str
+    email: str
+    full_name: str
+    role: str
+    is_active: bool
+    api_key: Optional[str] = None
+    created_at: datetime
+
+@app.post("/api/auth/register", response_model=UserResponse)
+def register_user(payload: UserRegisterRequest, request: Request, db: Session = Depends(get_db)):
+    if len(payload.username.strip()) < 3:
+        raise HTTPException(400, "Username must be at least 3 characters.")
+    if len(payload.password) < 6:
+        raise HTTPException(400, "Password must be at least 6 characters.")
+    
+    existing = db.query(models.User).filter(
+        (models.User.username == payload.username.strip()) | (models.User.email == payload.email.strip().lower())
+    ).first()
+    if existing:
+        raise HTTPException(409, "Username or email is already registered.")
+    
+    role = payload.role if payload.role in ["admin", "operator", "viewer"] else "operator"
+    hashed = hash_password(payload.password)
+    new_user = models.User(
+        username=payload.username.strip(),
+        email=payload.email.strip().lower(),
+        hashed_password=hashed,
+        full_name=payload.full_name or "",
+        role=role,
+        is_active=True,
+        api_key=generate_api_key()
+    )
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    
+    client_ip = request.client.host if request.client else "127.0.0.1"
+    log_audit_event(db, new_user.username, "USER_REGISTERED", f"user:{new_user.id}", {"role": role}, client_ip)
+    
+    return UserResponse(
+        id=new_user.id,
+        username=new_user.username,
+        email=new_user.email,
+        full_name=new_user.full_name,
+        role=new_user.role,
+        is_active=new_user.is_active,
+        api_key=new_user.api_key,
+        created_at=new_user.created_at
+    )
+
+@app.post("/api/auth/login", response_model=TokenResponse)
+def login_user(payload: UserLoginRequest, request: Request, db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.username == payload.username.strip()).first()
+    if not user or not verify_password(payload.password, user.hashed_password):
+        raise HTTPException(401, "Invalid username or password credentials.")
+    if not user.is_active:
+        raise HTTPException(403, "Account has been deactivated.")
+    
+    user.last_login = datetime.now(timezone.utc)
+    db.commit()
+    
+    token = create_access_token({
+        "sub": user.username,
+        "user_id": user.id,
+        "role": user.role
+    })
+    
+    client_ip = request.client.host if request.client else "127.0.0.1"
+    log_audit_event(db, user.username, "USER_LOGGED_IN", f"user:{user.id}", {}, client_ip)
+    
+    return TokenResponse(
+        access_token=token,
+        token_type="bearer",
+        expires_in_minutes=settings.jwt_expiration_minutes,
+        user_id=user.id,
+        username=user.username,
+        role=user.role
+    )
+
+@app.get("/api/auth/me", response_model=UserResponse)
+def get_auth_me(current_user: Optional[models.User] = Depends(get_current_user)):
+    if not current_user:
+        raise HTTPException(401, "Not authenticated.")
+    return UserResponse(
+        id=current_user.id,
+        username=current_user.username,
+        email=current_user.email,
+        full_name=current_user.full_name,
+        role=current_user.role,
+        is_active=current_user.is_active,
+        api_key=current_user.api_key,
+        created_at=current_user.created_at
+    )
+
+@app.post("/api/auth/api-key")
+def rotate_api_key(current_user: Optional[models.User] = Depends(get_current_user), db: Session = Depends(get_db)):
+    if not current_user:
+        raise HTTPException(401, "Authentication required to generate API key.")
+    current_user.api_key = generate_api_key()
+    db.commit()
+    return {"api_key": current_user.api_key}
+
+@app.get("/api/metrics")
+def get_prometheus_metrics(db: Session = Depends(get_db)):
+    content = metrics_registry.generate_exposition(db)
+    return Response(content=content, media_type="text/plain; version=0.0.4; charset=utf-8")
+
 @app.get("/api/health")
 def api_health(db: Session = Depends(get_db)):
     update_device_statuses(db)
@@ -229,8 +426,6 @@ def api_health(db: Session = Depends(get_db)):
     return {
         "status": "online",
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "diagnosis_configured": bool(settings.plant_id_api_key),
-        "chat_configured": bool(settings.groq_api_key),
         "online_devices": active_devices
     }
 
@@ -293,29 +488,75 @@ def dashboard(db: Session = Depends(get_db)):
 @app.post("/api/camera/upload")
 async def receive_camera_image(
     request: Request,
+    background_tasks: BackgroundTasks,
     device_id: Optional[str] = "esp32-cam-01",
     plant_id: Optional[int] = Form(None),
+    query_plant_id: Optional[int] = Query(None, alias="plant_id"),
     image: Optional[UploadFile] = File(None),
     x_device_id: Optional[str] = Header(None),
+    x_plant_id: Optional[str] = Header(None),
+    async_mode: bool = Query(False),
+    x_async: Optional[str] = Header(None),
     db: Session = Depends(get_db)
 ):
     """
     Receives an incoming camera frame directly from ESP32-CAM via HTTP POST.
     Accepts both multipart form upload or raw binary JPEG payload.
     Automatically timestamps, registers to device, and triggers AI analysis pipeline.
+    Supports asynchronous fast acknowledgment for hardware devices with short timeouts.
     """
-    effective_dev_id = x_device_id or device_id or "esp32-cam-01"
-    client_ip = request.client.host if request.client else ""
+    effective_dev_id = (
+        x_device_id if isinstance(x_device_id, str) and x_device_id.strip()
+        else (device_id if isinstance(device_id, str) and device_id.strip() else "esp32-cam-01")
+    )
+    client_ip = request.client.host if request and hasattr(request, "client") and request.client else ""
     device = get_or_create_device(db, identifier=effective_dev_id, ip_address=client_ip)
 
-    # 1. Read bytes from multipart file or raw body
-    if image is not None:
-        raw_bytes = await image.read()
-    else:
-        raw_bytes = await request.body()
+    # 1. Read bytes from multipart file or raw body safely
+    raw_bytes = b""
+    if image is not None and hasattr(image, "read"):
+        try:
+            raw_bytes = await image.read()
+        except Exception:
+            pass
 
     if not raw_bytes:
-        raise HTTPException(400, "No image payload received in request.")
+        content_type = request.headers.get("content-type", "").lower()
+        if "multipart" in content_type:
+            try:
+                form = await request.form()
+                form_file = form.get("image") or form.get("file")
+                if form_file and hasattr(form_file, "read"):
+                    raw_bytes = await form_file.read()
+                elif isinstance(form_file, (bytes, bytearray)):
+                    raw_bytes = bytes(form_file)
+                
+                # Extract device_id or plant_id from form if passed
+                form_dev = form.get("device_id")
+                if form_dev and isinstance(form_dev, str) and form_dev.strip():
+                    effective_dev_id = form_dev.strip()
+                    device = get_or_create_device(db, identifier=effective_dev_id, ip_address=client_ip)
+                form_p = form.get("plant_id")
+                if form_p and str(form_p).isdigit():
+                    plant_id = int(form_p)
+            except Exception as exc:
+                print(f"Notice: Form read exception (handled): {exc}")
+
+    if not raw_bytes:
+        try:
+            if hasattr(request, "_body") and isinstance(request._body, (bytes, bytearray)):
+                raw_bytes = bytes(request._body)
+            elif hasattr(request, "body"):
+                body_res = request.body()
+                if asyncio.iscoroutine(body_res):
+                    raw_bytes = await body_res
+                else:
+                    raw_bytes = body_res
+        except Exception as exc:
+            print(f"Notice: Body stream read exception (handled): {exc}")
+
+    if not raw_bytes:
+        raise HTTPException(400, "No image payload received in request. Please select an image file to upload.")
 
     # 2. Validate image format & dimensions
     try:
@@ -326,26 +567,21 @@ async def receive_camera_image(
     # 3. Store validated image file
     saved_path = save_validated_image(pil_img, settings.upload_dir)
 
-    # 4. Resolve plant to associate
-    target_plant = None
-    if plant_id:
-        target_plant = db.get(models.Plant, plant_id)
-    if not target_plant:
-        target_plant = db.query(models.Plant).order_by(models.Plant.id.asc()).first()
-    
-    if not target_plant:
-        # Create a default plant container so monitoring history is immediately preserved
-        target_plant = models.Plant(
-            name="Monitored Plant (ESP32-CAM)",
-            species="Unknown Indoor Plant",
-            category="Houseplant",
-            location="Camera Station",
-            notes="Auto-registered for incoming ESP32-CAM stream.",
-            pot_size_cm=15
-        )
-        db.add(target_plant)
-        db.commit()
-        db.refresh(target_plant)
+    # 4. Resolve explicit plant association
+    resolved_plant_id = None
+    if isinstance(plant_id, int):
+        resolved_plant_id = plant_id
+    elif isinstance(query_plant_id, int):
+        resolved_plant_id = query_plant_id
+    elif isinstance(x_plant_id, str) and x_plant_id.strip().isdigit():
+        resolved_plant_id = int(x_plant_id.strip())
+
+    if resolved_plant_id is not None:
+        target_plant = db.get(models.Plant, resolved_plant_id)
+        if not target_plant:
+            raise HTTPException(404, f"Target plant with ID {resolved_plant_id} not found.")
+    else:
+        target_plant = None
 
     # 5. Record image in DB
     cam_img = record_received_camera_image(
@@ -358,14 +594,74 @@ async def receive_camera_image(
         height=height
     )
 
-    # 6. Execute full AI analysis & report generation pipeline
-    analysis = execute_plant_analysis_pipeline(
-        db,
-        plant=target_plant,
-        image_path=saved_path,
-        device=device,
-        cam_img=cam_img
-    )
+    # Check for asynchronous execution (via query param or X-Async header)
+    is_async = (isinstance(async_mode, bool) and async_mode) or (isinstance(x_async, str) and x_async.lower() in ("true", "1", "yes"))
+    if is_async:
+        cam_img.processing_status = "queued"
+        db.commit()
+
+        def _bg_process(img_id: int):
+            with Session(bind=engine) as bg_db:
+                curr_img = bg_db.get(models.CameraImage, img_id)
+                if not curr_img:
+                    return
+                curr_dev = curr_img.device
+                curr_plant = curr_img.plant
+                try:
+                    curr_img.processing_status = "analyzing"
+                    bg_db.commit()
+                    execute_plant_analysis_pipeline(
+                        bg_db,
+                        plant=curr_plant,
+                        image_path=curr_img.file_path,
+                        device=curr_dev,
+                        cam_img=curr_img
+                    )
+                    curr_img.processing_status = "completed"
+                    bg_db.commit()
+                except Exception as err:
+                    curr_img.processing_status = "failed"
+                    curr_img.error_message = str(err)[:290]
+                    bg_db.commit()
+
+        background_tasks.add_task(_bg_process, cam_img.id)
+
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "accepted",
+                "job_status": "queued",
+                "message": "Image received, validated, and queued for asynchronous processing.",
+                "image_id": cam_img.id,
+                "image_url": image_url(saved_path),
+                "device_id": device.identifier,
+                "plant_id": target_plant.id if target_plant else None,
+                "timestamp": cam_img.timestamp.isoformat() if cam_img.timestamp else None
+            }
+        )
+
+    # 6. Execute full AI analysis & report generation pipeline synchronously
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        analysis = await run_in_threadpool(execute_plant_analysis_pipeline,
+            db,
+            plant=target_plant,
+            image_path=saved_path,
+            device=device,
+            cam_img=cam_img
+        )
+    else:
+        analysis = execute_plant_analysis_pipeline(
+            db,
+            plant=target_plant,
+            image_path=saved_path,
+            device=device,
+            cam_img=cam_img
+        )
 
     return {
         "status": "success",
@@ -373,7 +669,7 @@ async def receive_camera_image(
         "image_id": cam_img.id,
         "image_url": image_url(saved_path),
         "device_id": device.identifier,
-        "plant_id": target_plant.id,
+        "plant_id": analysis.plant_id,
         "analysis_id": analysis.id,
         "health_status": analysis.health_status,
         "timestamp": cam_img.timestamp
@@ -381,20 +677,85 @@ async def receive_camera_image(
 
 @app.post("/api/devices/{device_id}/heartbeat")
 @app.post("/api/camera/heartbeat")
-def receive_device_heartbeat(
+async def receive_device_heartbeat(
     device_id: str = "esp32-cam-01",
     request: Request = None,
     db: Session = Depends(get_db)
 ):
-    """Receives periodic heartbeat ping from ESP32-CAM device."""
+    """Receives periodic heartbeat ping and sensor telemetry from ESP32-CAM device."""
     client_ip = request.client.host if request and request.client else ""
     dev = record_device_heartbeat(db, identifier=device_id, ip_address=client_ip)
+
+    # Ingest sensor telemetry if provided in JSON payload
+    try:
+        body = await request.json() if request else {}
+    except Exception:
+        body = {}
+
+    if isinstance(body, dict) and any(k in body for k in ("soil_moisture_pct", "raw_adc", "ambient_temp_c", "humidity_pct")):
+        from .watering_engine import calibrate_soil_moisture
+        raw_adc = body.get("raw_adc")
+        moisture_pct = body.get("soil_moisture_pct")
+        substrate = body.get("substrate", "Potting Mix")
+
+        if raw_adc is not None and moisture_pct is None:
+            moisture_pct, _ = calibrate_soil_moisture(int(raw_adc), substrate=substrate)
+
+        assigned_plant = dev.analyses[0].plant if dev.analyses else db.query(models.Plant).first()
+        plant_id = body.get("plant_id") or (assigned_plant.id if assigned_plant else None)
+
+        telemetry = models.SensorTelemetry(
+            device_id=dev.id,
+            plant_id=plant_id,
+            soil_moisture_pct=float(moisture_pct) if moisture_pct is not None else None,
+            raw_adc=int(raw_adc) if raw_adc is not None else None,
+            ambient_temp_c=float(body.get("ambient_temp_c")) if body.get("ambient_temp_c") is not None else None,
+            humidity_pct=float(body.get("humidity_pct")) if body.get("humidity_pct") is not None else None,
+            substrate=substrate,
+            timestamp=datetime.now(timezone.utc)
+        )
+        db.add(telemetry)
+        db.commit()
+
     return {
         "status": "ok",
         "device_id": dev.identifier,
         "server_time": datetime.now(timezone.utc).isoformat(),
         "poll_interval_sec": dev.poll_interval_sec
     }
+
+@app.get("/api/devices/{device_id}/telemetry")
+@app.get("/api/plants/{plant_id}/telemetry")
+def get_sensor_telemetry(
+    device_id: Optional[str] = None,
+    plant_id: Optional[int] = None,
+    limit: int = 50,
+    db: Session = Depends(get_db)
+):
+    """Returns historical sensor time-series telemetry (soil moisture, temperature, humidity)."""
+    q = db.query(models.SensorTelemetry)
+    if plant_id is not None:
+        q = q.filter(models.SensorTelemetry.plant_id == plant_id)
+    elif device_id:
+        dev = db.query(models.Device).filter(models.Device.identifier == device_id).first()
+        if dev:
+            q = q.filter(models.SensorTelemetry.device_id == dev.id)
+
+    items = q.order_by(models.SensorTelemetry.timestamp.desc()).limit(limit).all()
+    return [
+        {
+            "id": t.id,
+            "device_id": t.device_id,
+            "plant_id": t.plant_id,
+            "soil_moisture_pct": t.soil_moisture_pct,
+            "raw_adc": t.raw_adc,
+            "ambient_temp_c": t.ambient_temp_c,
+            "humidity_pct": t.humidity_pct,
+            "substrate": t.substrate,
+            "timestamp": t.timestamp
+        }
+        for t in items
+    ]
 
 @app.get("/api/devices")
 def list_devices(db: Session = Depends(get_db)):
@@ -439,6 +800,30 @@ def get_device_logs(device_id: str, limit: int = 50, db: Session = Depends(get_d
         }
         for l in logs
     ]
+
+@app.get("/api/camera/stream")
+def proxy_camera_stream():
+    """Forward the camera's MJPEG stream without polling still images."""
+    try:
+        client = httpx.Client(timeout=httpx.Timeout(connect=2.0, read=None, write=2.0, pool=2.0), follow_redirects=True)
+        upstream = client.send(client.build_request("GET", settings.camera_stream_url), stream=True)
+        upstream.raise_for_status()
+
+        def camera_stream():
+            try:
+                yield from upstream.iter_raw(chunk_size=1024)
+            finally:
+                upstream.close()
+                client.close()
+
+        return StreamingResponse(
+            camera_stream(),
+            media_type=upstream.headers.get("content-type", "multipart/x-mixed-replace; boundary=frame"),
+            headers={"Cache-Control": "no-store, no-transform", "X-Accel-Buffering": "no"},
+        )
+    except Exception as exc:
+        raise HTTPException(503, f"Live camera stream unavailable: {str(exc)}")
+
 
 @app.get("/api/camera/snapshot")
 def proxy_or_latest_camera_snapshot(
@@ -496,6 +881,8 @@ def trigger_camera_poll(
     target_url = url or settings.camera_snapshot_url
     if not target_url:
         raise HTTPException(400, "No camera snapshot URL configured. Set CAMERA_SNAPSHOT_URL in Settings.")
+
+    target_plant = db.get(models.Plant, plant_id) if plant_id else None
         
     try:
         with httpx.Client(timeout=10, follow_redirects=True) as client:
@@ -514,19 +901,6 @@ def trigger_camera_poll(
     saved_path = save_validated_image(pil_img, settings.upload_dir)
 
     device = get_or_create_device(db, identifier="esp32-cam-01")
-    target_plant = db.get(models.Plant, plant_id) if plant_id else db.query(models.Plant).first()
-    if not target_plant:
-        target_plant = models.Plant(
-            name="Monitored Plant (ESP32-CAM)",
-            species="Unknown Indoor Plant",
-            category="Houseplant",
-            location="Camera Station",
-            pot_size_cm=15
-        )
-        db.add(target_plant)
-        db.commit()
-        db.refresh(target_plant)
-
     cam_img = record_received_camera_image(
         db, device=device, plant=target_plant,
         file_path=saved_path, file_size=len(raw_bytes), width=width, height=height
@@ -690,22 +1064,36 @@ async def analyze_uploaded_leaf(
     except ValueError as val_err:
         raise HTTPException(400, str(val_err))
 
-    analysis = execute_plant_analysis_pipeline(db, plant=plant, image_path=saved_path)
+    analysis = await run_in_threadpool(execute_plant_analysis_pipeline, db, plant=plant, image_path=saved_path)
     return serialize_analysis(analysis)
 
 @app.get("/api/analyses")
 def list_analyses(
+    response: Response,
     plant_id: Optional[int] = None,
+    device_id: Optional[str] = None,
     health_filter: Optional[str] = None,
-    limit: int = 50,
+    disease_detected: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db)
 ):
     q = db.query(models.Analysis)
     if plant_id:
         q = q.filter(models.Analysis.plant_id == plant_id)
+    if device_id:
+        q = q.join(models.Device).filter(models.Device.identifier == device_id)
     if health_filter and health_filter != "all":
         q = q.filter(models.Analysis.health_status.ilike(f"%{health_filter}%"))
-    analyses = q.order_by(models.Analysis.timestamp.desc()).limit(limit).all()
+    if disease_detected:
+        q = q.filter(models.Analysis.disease_detected == disease_detected.lower())
+
+    total_count = q.count()
+    response.headers["X-Total-Count"] = str(total_count)
+    response.headers["X-Limit"] = str(limit)
+    response.headers["X-Offset"] = str(offset)
+
+    analyses = q.order_by(models.Analysis.timestamp.desc()).offset(offset).limit(limit).all()
     return [serialize_analysis(a) for a in analyses]
 
 @app.get("/api/analyses/latest")
@@ -726,11 +1114,23 @@ def get_analysis_by_id(analysis_id: int, db: Session = Depends(get_db)):
 # Report Endpoints
 # -------------------------------------------------------------
 @app.get("/api/reports")
-def list_reports(plant_id: Optional[int] = None, db: Session = Depends(get_db)):
+def list_reports(
+    response: Response,
+    plant_id: Optional[int] = None,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db)
+):
     q = db.query(models.Report)
     if plant_id:
         q = q.filter(models.Report.plant_id == plant_id)
-    reports = q.order_by(models.Report.created_at.desc()).all()
+
+    total_count = q.count()
+    response.headers["X-Total-Count"] = str(total_count)
+    response.headers["X-Limit"] = str(limit)
+    response.headers["X-Offset"] = str(offset)
+
+    reports = q.order_by(models.Report.created_at.desc()).offset(offset).limit(limit).all()
     return [
         {
             "id": r.id,
@@ -910,6 +1310,21 @@ def chat_with_bot(req: ChatRequest, db: Session = Depends(get_db)):
         else:
             plant_context = f"{target_plant.name} ({target_plant.species}), location: {target_plant.location}. No scans recorded yet."
 
+    # Add references relevant to the question itself, not only the latest diagnosis.
+    stop_words = {"what", "when", "where", "which", "with", "from", "that", "this", "your", "does", "have", "about", "could", "would", "should", "please", "tell"}
+    terms = [word.strip(".,?!:;()") for word in req.message.lower().split()]
+    terms = [word for word in terms if len(word) >= 4 and word not in stop_words][:6]
+    found = {}
+    for term in terms:
+        for entry in search_knowledge(db, query=term, limit=4):
+            found[entry.id] = entry
+    if found:
+        query_context = " | ".join(
+            f"{entry.title} ({entry.source_name}): {entry.summary}"
+            for entry in list(found.values())[:3]
+        )
+        knowledge_context = " | ".join(part for part in [knowledge_context, query_context] if part)
+
     # 2. Record user message
     user_msg = models.ChatMessage(
         conversation_id=convo.id,
@@ -999,6 +1414,28 @@ def get_knowledge_entry(entry_id: int, db: Session = Depends(get_db)):
 # -------------------------------------------------------------
 # Settings Endpoints
 # -------------------------------------------------------------
+class CameraSettings(BaseModel):
+    stream_url: str
+    snapshot_url: str
+
+def normalize_camera_url(url: str, *, stream: bool) -> str:
+    """Turn the ESP32 web UI root URL into the firmware's media endpoint."""
+    parsed = urlsplit(url.strip())
+    if parsed.path not in ("", "/"):
+        return urlunsplit(parsed)
+
+    host = parsed.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    port = parsed.port
+    if stream:
+        authority = f"{host}:{port if port and port != 80 else 81}"
+        path = "/stream"
+    else:
+        authority = f"{host}:{port}" if port else host
+        path = "/capture"
+    return urlunsplit((parsed.scheme, authority, path, "", ""))
+
 @app.get("/api/settings")
 def get_settings():
     return {
@@ -1007,9 +1444,44 @@ def get_settings():
         "device_offline_timeout_seconds": settings.device_offline_timeout_seconds,
         "monitoring_interval_seconds": settings.monitoring_interval_seconds,
         "min_confidence_threshold": settings.min_confidence_threshold,
-        "diagnosis_configured": bool(settings.plant_id_api_key),
-        "chat_configured": bool(settings.groq_api_key),
-        "chat_model": settings.groq_model
+    }
+
+@app.post("/api/settings/camera")
+def update_camera_settings(payload: CameraSettings, db: Session = Depends(get_db)):
+    stream_url = normalize_camera_url(payload.stream_url, stream=True)
+    snapshot_url = normalize_camera_url(payload.snapshot_url, stream=False)
+    if not stream_url or not snapshot_url:
+        raise HTTPException(400, "Both camera URLs are required.")
+
+    settings.camera_stream_url = stream_url
+    settings.camera_snapshot_url = snapshot_url
+
+    env_path = Path(__file__).resolve().parent.parent / ".env"
+    if env_path.exists():
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+        replacements = {
+            "CAMERA_STREAM_URL": stream_url,
+            "CAMERA_SNAPSHOT_URL": snapshot_url,
+        }
+        for key, value in replacements.items():
+            prefix = f"{key}="
+            matches = [i for i, line in enumerate(lines) if line.startswith(prefix)]
+            if matches:
+                lines[matches[0]] = f"{prefix}{value}"
+            else:
+                lines.append(f"{prefix}{value}")
+        env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    devices = db.query(models.Device).all()
+    for device in devices:
+        device.stream_url = stream_url
+        device.snapshot_url = snapshot_url
+    db.commit()
+
+    return {
+        "camera_stream_url": stream_url,
+        "camera_snapshot_url": snapshot_url,
+        "status": "saved",
     }
 
 @app.post("/api/settings/test-camera")
@@ -1027,12 +1499,3 @@ def test_camera_connection(url: str = Query(...)):
             "connected": False,
             "message": f"Camera did not respond: {str(exc)}"
         }
-
-@app.post("/api/settings/test-ai")
-def test_ai_services():
-    return {
-        "diagnosis_configured": bool(settings.plant_id_api_key),
-        "chat_configured": bool(settings.groq_api_key),
-        "chat_model": settings.groq_model,
-        "local_vision_engine": "Active & Ready"
-    }

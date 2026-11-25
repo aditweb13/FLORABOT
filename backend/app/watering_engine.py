@@ -1,5 +1,76 @@
 import math
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
+
+# Substrate Calibration Curves:
+# Maps raw 12-bit ADC reading (capacitive sensor v1.2: ~3200 air/dry to ~1400 water/saturated)
+# to calibrated volumetric water content (VWC) percentage accounting for substrate porosity.
+SUBSTRATE_CALIBRATION_CURVES = {
+    "Potting Mix": {"dry_adc": 3100, "wet_adc": 1450, "optimal_min": 25.0, "optimal_max": 65.0},
+    "Aroid Mix": {"dry_adc": 3250, "wet_adc": 1600, "optimal_min": 20.0, "optimal_max": 55.0},
+    "Succulent / Cactus": {"dry_adc": 3300, "wet_adc": 1750, "optimal_min": 10.0, "optimal_max": 35.0},
+    "Peat / Sphagnum": {"dry_adc": 2950, "wet_adc": 1300, "optimal_min": 35.0, "optimal_max": 75.0},
+}
+
+def calibrate_soil_moisture(raw_adc: int, substrate: str = "Potting Mix") -> Tuple[float, str]:
+    """
+    Converts raw 12-bit capacitive soil sensor ADC value into calibrated volumetric moisture %.
+    """
+    curve = SUBSTRATE_CALIBRATION_CURVES.get(substrate, SUBSTRATE_CALIBRATION_CURVES["Potting Mix"])
+    dry = curve["dry_adc"]
+    wet = curve["wet_adc"]
+
+    # Invert capacitive reading: higher ADC = dryer, lower ADC = wetter
+    clamped_adc = max(wet, min(dry, raw_adc))
+    moisture_pct = ((dry - clamped_adc) / (dry - wet)) * 100.0
+    moisture_pct = round(max(0.0, min(100.0, moisture_pct)), 1)
+
+    if moisture_pct < curve["optimal_min"]:
+        eval_status = "dry"
+    elif moisture_pct > curve["optimal_max"]:
+        eval_status = "saturated"
+    else:
+        eval_status = "optimal"
+
+    return moisture_pct, eval_status
+
+def evaluate_irrigation_safety_lock(
+    target_volume_ml: Optional[int],
+    calibrated_moisture_pct: Optional[float],
+    substrate: str = "Potting Mix",
+    max_single_dose_ml: int = 500
+) -> Dict[str, Any]:
+    """
+    Hardware fail-safe and watchdog safety logic for automated pump/valve actuation.
+    Prevents flooding, continuous loop actuation, and watering already-saturated soil.
+    """
+    curve = SUBSTRATE_CALIBRATION_CURVES.get(substrate, SUBSTRATE_CALIBRATION_CURVES["Potting Mix"])
+    
+    # 1. Moisture Saturation Cutoff
+    if calibrated_moisture_pct is not None and calibrated_moisture_pct >= curve["optimal_max"]:
+        return {
+            "irrigation_allowed": False,
+            "dispense_volume_ml": 0,
+            "safety_lock_reason": f"Moisture ({calibrated_moisture_pct}%) already exceeds substrate saturation threshold ({curve['optimal_max']}%)."
+        }
+
+    # 2. Volume Safety Ceiling
+    if not target_volume_ml or target_volume_ml <= 0:
+        return {
+            "irrigation_allowed": False,
+            "dispense_volume_ml": 0,
+            "safety_lock_reason": "No positive target watering volume requested."
+        }
+
+    clamped_dose = min(target_volume_ml, max_single_dose_ml)
+    # 3. Calculate max pump run time at standard 12V 100ml/min mini pump
+    max_pump_duration_seconds = max(2, int(clamped_dose / 100.0 * 60))
+
+    return {
+        "irrigation_allowed": True,
+        "dispense_volume_ml": clamped_dose,
+        "safety_lock_reason": "Safe to dispense within watchdog volume and time bounds.",
+        "pump_watchdog_timeout_sec": max_pump_duration_seconds
+    }
 
 def calculate_watering_recommendation(
     species: str,
@@ -43,19 +114,25 @@ def calculate_watering_recommendation(
             "Visual drooping was detected. Because foliage drooping can be caused by both underwatering (desiccation) "
             "and overwatering (root hypoxia / suffocation), manual soil moisture verification is required."
         )
-    elif "chlorosis" in norm_stress or "yellow" in norm_stress:
+    elif "chlorosis" in norm_stress or ("yellow" in norm_stress and not norm_stress.startswith("no ")):
         if is_drought_tolerant:
             status = "Possible overwatering"
             reason = f"Yellowing foliage on drought-tolerant {species or 'succulent'} often indicates root zone over-saturation."
         else:
             status = "Check soil before watering"
             reason = "Leaf chlorosis detected. Check whether soil is waterlogged or depleted of nutrients."
+    elif ("brown" in norm_stress and not norm_stress.startswith("no ")) or "necrosis" in norm_stress:
+        status = "Check soil before watering"
+        reason = "Visible browning has several possible causes. Check soil moisture before changing watering; the photo cannot confirm the cause."
     elif norm_status == "healthy":
         status = "No immediate watering recommendation"
         reason = "Foliage exhibits healthy turgor and normal vegetative vitality. Maintain scheduled checking cycle."
     elif norm_status in ["image unsuitable", "unscanned"]:
         status = "Insufficient information"
         reason = "Foliage condition could not be verified from the image."
+    elif "not assessed" in norm_stress or "no visible" in norm_stress or "no obvious" in norm_stress or "inconclusive" in norm_status:
+        status = "Check soil moisture before watering"
+        reason = "A photo cannot measure soil moisture. Check the top 2 inches of soil and water only if it feels dry."
     else:
         status = "Watering condition uncertain"
         reason = "Symptoms observed may not be directly moisture-related. Check soil 2 inches below surface before watering."
@@ -112,6 +189,8 @@ def calculate_watering_recommendation(
             f"If it comes out clean and dry, provide approximately {quantity_ml or '150–250'} ml of water. "
             "If it comes out damp with sticking soil, do not add water."
         )
+    elif status == "Check soil moisture before watering":
+        instructions = "Check the top 2 inches of soil by touch. If dry, water gradually; if damp, do not water. No amount is estimated because the image does not reveal soil moisture."
     else:
         instructions = (
             "No immediate hydration needed today. Continue periodic observation and inspect soil before the next scheduled check."

@@ -58,6 +58,11 @@ type Analysis = {
   watering_instructions: string;
   provider_engine: string;
   provider_reference: string;
+  detections?: Array<{ id: string; class_id: number; label: string; confidence: number; x1: number; y1: number; x2: number; y2: number; image_width: number; image_height: number; source?: string; detection_type?: string }>;
+  detection_model?: { model_name?: string; model_version?: string; device?: string; inference_seconds?: number; model_load_seconds?: number; class_count?: number };
+  identification_candidates?: Array<{ scientific_name: string; common_names?: string[]; score: number }>;
+  original_image?: string;
+  annotated_image?: string | null;
   plant_name?: string;
 };
 
@@ -163,9 +168,12 @@ const healthBadgeClass = (s = '') => {
   if (low.includes('healthy')) return 'healthy';
   if (low.includes('disease')) return 'danger';
   if (low.includes('stress') || low.includes('wilting') || low.includes('attention')) return 'attention';
-  if (low.includes('inconclusive') || low.includes('unsuitable')) return 'muted';
+  if (low.includes('inconclusive') || low.includes('unsuitable') || low.includes('image needs')) return 'muted';
   return 'neutral';
 };
+const speciesDisplay = (s?: string | null) =>
+  !s || ['unknown plant', 'unknown', 'species not identified'].includes(s.trim().toLowerCase())
+    ? 'Species not identified' : s;
 
 export default function App() {
   const [viewMode, setViewMode] = useState<'landing' | 'app'>('app');
@@ -377,9 +385,6 @@ export default function App() {
           {page === 'Live Plant Monitor' && (
             <LivePlantMonitorPage
               dash={dash}
-              plants={plants}
-              selectedPlant={selectedPlant}
-              setSelectedPlant={setSelectedPlant}
               onAnalysisComplete={(a: Analysis) => {
                 setActiveAnalysis(a);
                 setActiveModal('result');
@@ -746,11 +751,8 @@ function DashboardOverview({ dash, loading, onNavigate, onRegister, onOpenPlant,
           <p>Monitor, analyse and care for your indoor plants with real-time computer vision.</p>
         </div>
         <div className="heading-actions">
-          <button className="btn secondary" onClick={onRegister}>
-            <Plus size={16} /> Register Plant
-          </button>
           <button className="btn primary" onClick={() => onNavigate('Live Plant Monitor')}>
-            <Camera size={16} /> Live Camera Feed
+            <Camera size={16} /> Capture &amp; Analyze
           </button>
         </div>
       </div>
@@ -795,90 +797,17 @@ function DashboardOverview({ dash, loading, onNavigate, onRegister, onOpenPlant,
         </div>
       </div>
 
-      {/* Camera & Diagnostics Split */}
-      <div className="dashboard-lower" style={{ marginBottom: '24px' }}>
-        {/* Camera Live Card */}
-        <div className="card" style={{ padding: '19px' }}>
-          <div className="card-heading">
-            <div>
-              <div className="eyebrow">HARDWARE FEED</div>
-              <h3>Latest ESP32-CAM Observation</h3>
-            </div>
-            <button className="text-link" onClick={() => onNavigate('Live Plant Monitor')}>
-              Live Monitor <ArrowRight size={14} />
-            </button>
-          </div>
-          <div style={{ marginTop: '12px', height: '175px', borderRadius: '9px', overflow: 'hidden', background: '#1c2821', position: 'relative' }}>
-            {dash?.latest_camera_image ? (
-              <img src={imgUrl(dash.latest_camera_image)} alt="Camera Observation" style={{ width: '100%', height: '100%', objectFit: 'contain' }} />
-            ) : (
-              <div style={{ height: '100%', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', color: '#97a89b', gap: '8px' }}>
-                <Camera size={32} />
-                <span style={{ fontSize: '11px' }}>Awaiting frame transmission from ESP32-CAM</span>
-              </div>
-            )}
-            <div style={{ position: 'absolute', bottom: '8px', left: '8px', background: '#0e1f16d4', color: '#fff', padding: '4px 8px', borderRadius: '5px', fontSize: '10px' }}>
-              {dash?.latest_image_time ? `Received: ${fmtDate(dash.latest_image_time)} ${fmtTime(dash.latest_image_time)}` : 'No frames recorded yet'}
-            </div>
-          </div>
-          <div style={{ marginTop: '12px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '11px', color: '#687e70' }}>
-            <span>Hardware Status: <b style={{ color: dash?.camera_online ? '#2e7d32' : '#b45309' }}>{dash?.camera_online ? 'Connected / Online' : 'Standby / Awaiting Heartbeat'}</b></span>
-            <button className="btn secondary small" onClick={async () => {
-              try {
-                await api('/api/camera/poll-now', { method: 'POST' });
-                setToast('Camera frame polled and analyzed.');
-              } catch (e: any) {
-                setToast(e.message);
-              }
-            }}>
-              <RefreshCw size={12} /> Poll Snapshot Now
-            </button>
-          </div>
+      {/* Latest AI Diagnostics */}
+      <div className="card" style={{ padding: '19px', marginBottom: '24px' }}>
+        <div className="card-heading"><div><div className="eyebrow">LATEST ANALYSIS</div><h3>Most Recent Diagnostic Check</h3></div>
+          {latestAnalysis && <span className={`badge ${healthBadgeClass(latestAnalysis.health_status)}`}>{latestAnalysis.health_status}</span>}
         </div>
-
-        {/* Latest AI Diagnostics Card */}
-        <div className="card" style={{ padding: '19px' }}>
-          <div className="card-heading">
-            <div>
-              <div className="eyebrow">LATEST ANALYSIS</div>
-              <h3>Most Recent Diagnostic Check</h3>
-            </div>
-            {latestAnalysis && (
-              <span className={`badge ${healthBadgeClass(latestAnalysis.health_status)}`}>
-                {latestAnalysis.health_status}
-              </span>
-            )}
-          </div>
-          {latestAnalysis ? (
-            <div style={{ marginTop: '12px', display: 'grid', gap: '10px' }}>
-              <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
-                <img src={imgUrl(latestAnalysis.image)} alt="Analyzed leaf" style={{ width: '56px', height: '56px', borderRadius: '8px', objectFit: 'cover' }} />
-                <div>
-                  <b style={{ fontSize: '13px', color: '#253f30' }}>{latestAnalysis.plant_name || 'Plant'}</b>
-                  <span style={{ fontSize: '11px', color: '#708376', display: 'block' }}>{latestAnalysis.plant_identification} · {fmtDate(latestAnalysis.timestamp)}</span>
-                  <span style={{ fontSize: '10px', color: '#4b6b55' }}>Condition: {latestAnalysis.disease_name || 'Healthy'}</span>
-                </div>
-              </div>
-              <div style={{ background: '#f6f9f5', padding: '10px', borderRadius: '8px', fontSize: '11px', color: '#4d6455', lineHeight: 1.5 }}>
-                <b>Observation:</b> {latestAnalysis.symptoms}
-              </div>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <span style={{ fontSize: '11px', color: '#6a7d71' }}>
-                  Watering: <b>{latestAnalysis.watering_quantity_ml ? `${latestAnalysis.watering_quantity_ml} ml` : latestAnalysis.watering_status}</b>
-                </span>
-                <button className="btn primary small" onClick={() => onAnalysisClick(latestAnalysis)}>
-                  View Full Report
-                </button>
-              </div>
-            </div>
-          ) : (
-            <div className="empty-activity">
-              <Leaf />
-              <b>No diagnostics run yet</b>
-              <span>Transmit an ESP32-CAM frame or upload a photo to start.</span>
-            </div>
-          )}
-        </div>
+        {latestAnalysis ? <div style={{ marginTop: '12px', display: 'grid', gap: '10px' }}>
+          <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}><img src={imgUrl(latestAnalysis.image)} alt="Analyzed plant" style={{ width: '56px', height: '56px', borderRadius: '8px', objectFit: 'cover' }} />
+            <div><b style={{ fontSize: '13px', color: '#253f30' }}>{latestAnalysis.plant_name || 'Discovered plant'}</b><span style={{ fontSize: '11px', color: '#708376', display: 'block' }}>{speciesDisplay(latestAnalysis.plant_identification)} ? {fmtDate(latestAnalysis.timestamp)}</span><span style={{ fontSize: '10px', color: '#4b6b55' }}>{latestAnalysis.disease_name || 'No specific disease identified'}</span></div>
+          </div><div style={{ background: '#f6f9f5', padding: '10px', borderRadius: '8px', fontSize: '11px', color: '#4d6455' }}>{latestAnalysis.symptoms}</div>
+          <button className="btn primary small" style={{ justifySelf: 'end' }} onClick={() => onAnalysisClick(latestAnalysis)}>View Full Report</button></div>
+          : <div className="empty-activity"><Leaf /><b>No diagnostics run yet</b><span>Capture a plant image in Live Plant Monitor to begin.</span></div>}
       </div>
 
       {/* Registered Plants Grid */}
@@ -930,10 +859,10 @@ function DashboardOverview({ dash, loading, onNavigate, onRegister, onOpenPlant,
         <div className="inline-empty">
           <div className="inline-empty-icon"><Flower2 /></div>
           <div>
-            <b>No plants registered yet</b>
-            <span>Register your indoor plants so ESP32-CAM observations are automatically assigned.</span>
+            <b>No plants discovered yet</b>
+            <span>Capture an image and FloraBOT will identify and organize the plant automatically.</span>
           </div>
-          <button className="btn secondary" onClick={onRegister}><Plus size={15} /> Register First Plant</button>
+          <button className="btn primary" onClick={() => onNavigate('Live Plant Monitor')}><Camera size={15} /> Capture a Plant</button>
         </div>
       )}
     </section>
@@ -943,178 +872,42 @@ function DashboardOverview({ dash, loading, onNavigate, onRegister, onOpenPlant,
 // ============================================================================
 // 3. LIVE PLANT MONITOR PAGE
 // ============================================================================
-function LivePlantMonitorPage({ dash, plants, selectedPlant, setSelectedPlant, onAnalysisComplete, onOpenSettings, setToast }: any) {
-  const [streamUrl, setStreamUrl] = useState(dash?.devices?.[0]?.stream_url || 'http://10.105.234.29:81/stream');
-  const [snapshotUrl, setSnapshotUrl] = useState(dash?.devices?.[0]?.snapshot_url || 'http://10.105.234.29/capture');
+function LivePlantMonitorPage({ dash, onAnalysisComplete, onOpenSettings, setToast }: any) {
+  const [selectedDeviceId, setSelectedDeviceId] = useState<number | null>(dash?.devices?.[0]?.id || null);
   const [latestFrame, setLatestFrame] = useState<string | null>(dash?.latest_camera_image || null);
-  const [isLiveStream, setIsLiveStream] = useState(false);
-  const [pollingBusy, setPollingBusy] = useState(false);
-  const [uploadFile, setUploadFile] = useState<File | null>(null);
-
-  const activeDevice = dash?.devices?.[0];
-
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState('Camera ready');
+  const activeDevice = dash?.devices?.find((d: Device) => d.id === selectedDeviceId) || dash?.devices?.[0];
+  const snapshotUrl = activeDevice?.snapshot_url || 'http://10.105.234.29/capture';
+  const analyzeResponse = async (res: any) => {
+    if (!res.analysis_id) throw new Error('Image was received but no analysis was completed.');
+    const result = await api(`/api/analyses/${res.analysis_id}`);
+    setLatestFrame(result.image); onAnalysisComplete(result); setStatus('Analysis complete'); setToast('Capture analyzed and saved to plant history.');
+  };
   const handlePollNow = async () => {
-    setPollingBusy(true);
-    try {
-      const res = await api(`/api/camera/poll-now?url=${encodeURIComponent(snapshotUrl)}${selectedPlant ? `&plant_id=${selectedPlant.id}` : ''}`, {
-        method: 'POST'
-      });
-      setLatestFrame(res.image_url);
-      setToast('ESP32-CAM frame successfully ingested and analyzed!');
-      if (res.analysis_id) {
-        const fullA = await api(`/api/analyses/${res.analysis_id}`);
-        onAnalysisComplete(fullA);
-      }
-    } catch (e: any) {
-      setToast(`Snapshot failed: ${e.message}`);
-    } finally {
-      setPollingBusy(false);
-    }
+    setBusy(true); setStatus('Capturing image');
+    try { setStatus('Receiving and validating frame'); const res = await api(`/api/camera/poll-now?url=${encodeURIComponent(snapshotUrl)}`, { method: 'POST' }); setLatestFrame(res.image_url); setStatus('Identifying plant and analyzing disease'); await analyzeResponse(res); }
+    catch (e: any) { setStatus('Capture failed'); setToast(`Capture failed: ${e.message}`); } finally { setBusy(false); }
   };
-
-  const handleManualUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const f = e.target.files?.[0];
-    if (!f) return;
-    setUploadFile(f);
-    setPollingBusy(true);
-    const fd = new FormData();
-    fd.append('image', f);
-    if (selectedPlant) fd.append('plant_id', String(selectedPlant.id));
-    fd.append('device_id', activeDevice?.identifier || 'esp32-cam-01');
-
-    try {
-      const res = await api('/api/camera/upload', { method: 'POST', body: fd });
-      setLatestFrame(res.image_url);
-      setToast('Frame ingested into ESP32-CAM pipeline and analyzed.');
-      if (res.analysis_id) {
-        const fullA = await api(`/api/analyses/${res.analysis_id}`);
-        onAnalysisComplete(fullA);
-      }
-    } catch (err: any) {
-      setToast(err.message);
-    } finally {
-      setPollingBusy(false);
-    }
+  const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0]; if (!f) return; setBusy(true); setStatus('Uploading and validating image');
+    const fd = new FormData(); fd.append('image', f); fd.append('device_id', activeDevice?.identifier || 'manual-capture');
+    try { const res = await api('/api/camera/upload', { method: 'POST', body: fd }); setStatus('Identifying plant and analyzing disease'); await analyzeResponse(res); }
+    catch (err: any) { setStatus('Analysis failed'); setToast(`Analysis failed: ${err.message}`); } finally { setBusy(false); e.target.value = ''; }
   };
-
-  return (
-    <section>
-      <div className="page-heading">
-        <div>
-          <div className="eyebrow">HARDWARE INTEGRATION</div>
-          <h1>Live Plant Monitor</h1>
-          <p>Real-time video preview and autonomous image ingestion from your ESP32-CAM hardware.</p>
-        </div>
-        <div className="heading-actions">
-          <button className="btn secondary" onClick={onOpenSettings}>
-            <SettingsIcon size={16} /> Configure Stream URLs
-          </button>
-        </div>
-      </div>
-
-      <div className="camera-layout">
-        <div className="card camera-card">
-          <div className="camera-top">
-            <div className="cam-title">
-              <span className={`cam-status ${activeDevice?.status === 'online' ? 'connected' : ''}`}>
-                <i />
-                {activeDevice?.status?.toUpperCase() || 'STANDBY'}
-              </span>
-              <span>{isLiveStream ? streamUrl : 'Latest Captured Frame'}</span>
-            </div>
-            <div style={{ display: 'flex', gap: '8px' }}>
-              <button
-                className={`btn small ${isLiveStream ? 'primary' : 'secondary'}`}
-                onClick={() => setIsLiveStream(!isLiveStream)}
-              >
-                {isLiveStream ? 'Showing Live MJPEG' : 'Switch to Live MJPEG'}
-              </button>
-            </div>
-          </div>
-
-          <div className="camera-viewport" style={{ height: '360px' }}>
-            {isLiveStream ? (
-              <img
-                src={streamUrl}
-                alt="Live Camera Stream"
-                className="camera-stream"
-                onError={() => {
-                  setToast('Live MJPEG stream unreachable. Ensure ESP32-CAM is powered and on the same Wi-Fi.');
-                  setIsLiveStream(false);
-                }}
-              />
-            ) : latestFrame ? (
-              <img src={imgUrl(latestFrame)} alt="Latest Snapshot" className="camera-preview" />
-            ) : (
-              <div className="camera-unset">
-                <div className="camera-icon-large">
-                  <Camera size={34} />
-                </div>
-                <b>No Camera Image Available</b>
-                <span>Click &quot;Poll Camera Now&quot; to fetch a snapshot from your ESP32-CAM.</span>
-              </div>
-            )}
-            <span className="viewfinder v1" />
-            <span className="viewfinder v2" />
-            <span className="camera-time">
-              {dash?.latest_image_time ? `Last frame: ${fmtDate(dash.latest_image_time)} ${fmtTime(dash.latest_image_time)}` : 'Hardware ready'}
-            </span>
-          </div>
-
-          <div className="camera-controls">
-            <button className="btn secondary" onClick={handlePollNow} disabled={pollingBusy}>
-              <RefreshCw size={15} className={pollingBusy ? 'spinner' : ''} />
-              {pollingBusy ? 'Fetching & Analyzing…' : 'Poll Camera Now'}
-            </button>
-            <label className="btn secondary" style={{ cursor: 'pointer' }}>
-              <Upload size={15} /> Upload Test Leaf
-              <input type="file" accept="image/*" hidden onChange={handleManualUpload} />
-            </label>
-          </div>
-
-          <div className="camera-foot">
-            <span><Wifi size={14} /> IP: {activeDevice?.ip_address || '10.105.234.29'}</span>
-            <span>Images are automatically processed by Computer Vision upon arrival.</span>
-          </div>
-        </div>
-
-        {/* Camera Sidebar info */}
-        <div className="card camera-side">
-          <div className="eyebrow">MONITORED TARGET</div>
-          <h3>Assign Incoming Frames</h3>
-          <p>Frames sent by ESP32-CAM will be associated with this plant record.</p>
-
-          <label className="field-label">Target Plant</label>
-          <select
-            value={selectedPlant?.id || ''}
-            onChange={(e) => setSelectedPlant(plants.find((p: Plant) => p.id === Number(e.target.value)) || null)}
-          >
-            <option value="">Select monitored plant…</option>
-            {plants.map((p: Plant) => (
-              <option key={p.id} value={p.id}>
-                {p.name} ({p.species})
-              </option>
-            ))}
-          </select>
-
-          <div className="camera-tip">
-            <div><Leaf size={18} /></div>
-            <span>
-              <b>Camera Positioning</b> Point the lens 15–35 cm from the foliage in bright, indirect light. Avoid strong backlight behind the leaves.
-            </span>
-          </div>
-
-          <div style={{ marginTop: '16px', background: '#f8faf7', border: '1px solid #e7eee6', borderRadius: '8px', padding: '12px', fontSize: '11px', color: '#526859', lineHeight: 1.6 }}>
-            <b>Hardware Endpoint:</b>
-            <code style={{ display: 'block', margin: '4px 0', background: '#eef5ec', padding: '4px', borderRadius: '4px', fontSize: '10px' }}>
-              POST /api/devices/{activeDevice?.identifier || 'esp32-cam-01'}/images
-            </code>
-            <span>ESP32-CAM firmware can POST JPEG directly to this URL at regular intervals.</span>
-          </div>
-        </div>
-      </div>
-    </section>
-  );
+  return <section>
+    <div className="page-heading"><div><div className="eyebrow">AUTOMATIC PLANT DISCOVERY</div><h1>Live Plant Monitor</h1><p>Live video stays on. Click Capture &amp; Analyze to take one still image and send that same image for analysis.</p></div><div className="heading-actions"><button className="btn secondary" onClick={onOpenSettings}><SettingsIcon size={16} /> Camera Settings</button></div></div>
+    <div className="camera-layout"><div className="card camera-card">
+      <div className="camera-top"><div className="cam-title"><span className={`cam-status ${activeDevice?.status === 'online' ? 'connected' : ''}`}><i />{activeDevice?.status?.toUpperCase() || 'STANDBY'}</span><span>Live camera video</span></div></div>
+      <div className="camera-viewport" style={{ height: '360px' }}><img src="/api/camera/stream" alt="Live camera stream" className="camera-stream" onError={() => setToast('Live stream unavailable. Check camera settings and network.')} /><span className="viewfinder v1" /><span className="viewfinder v2" /></div>
+      <div className="camera-controls"><button className="btn primary" onClick={handlePollNow} disabled={busy}><RefreshCw size={15} className={busy ? 'spinner' : ''} />{busy ? 'Processing?' : 'Capture & Analyze'}</button><label className="btn secondary" style={{ cursor: busy ? 'not-allowed' : 'pointer' }}><Upload size={15} /> Analyze Image<input type="file" accept="image/*" hidden disabled={busy} onChange={handleUpload} /></label></div>
+      <div className="camera-foot"><span><Wifi size={14} />{activeDevice?.ip_address || 'Camera endpoint configured in Settings'}</span><span>{status}</span></div>
+    </div><div className="card camera-side"><div className="eyebrow">CAPTURE WORKFLOW</div><h3>Automatic discovery</h3><p>No plant setup is needed. FloraBOT saves every valid capture and its analysis in monitoring history.</p>
+      {dash?.devices?.length > 1 && <><label className="field-label">Camera</label><select value={activeDevice?.id || ''} onChange={e => setSelectedDeviceId(Number(e.target.value))}>{dash.devices.map((d: Device) => <option key={d.id} value={d.id}>{d.name} ? {d.status}</option>)}</select></>}
+      <div className="camera-tip"><div><Leaf size={18} /></div><span><b>What happens after capture</b>Image validation ? species identification ? visual health assessment ? plant discovery ? saved observation.</span></div>
+      {latestFrame && <div className="captured-card"><img src={imgUrl(latestFrame)} alt="Latest saved capture"/><div><b>Latest capture</b><span>{status}</span></div><Check size={15}/></div>}<button className="btn secondary" style={{ width: '100%', marginTop: 14 }} onClick={onOpenSettings}><SettingsIcon size={14} /> Configure camera endpoint</button>
+    </div></div>
+  </section>;
 }
 
 // ============================================================================
@@ -1179,7 +972,7 @@ function AIAnalysisPage({ plants, selectedPlant, onSelectAnalysis, onConsultAssi
                       {a.health_status}
                     </span>
                   </div>
-                  <span>{a.plant_identification} · {fmtDate(a.timestamp)}</span>
+                  <span>{speciesDisplay(a.plant_identification)} · {fmtDate(a.timestamp)}</span>
                   <span style={{ color: '#2d6a4f', fontWeight: 600, marginTop: '2px' }}>
                     {a.disease_name || 'No Pathology Detected'}
                   </span>
@@ -1353,7 +1146,7 @@ function MonitoringHistoryPage({ plants, onSelectAnalysis }: any) {
                 ))}
               </select>
               <img src={imgUrl(compareLeft.image)} alt="Scan Left" style={{ marginTop: '10px' }} />
-              <span>{compareLeft.plant_identification} · {compareLeft.health_status}</span>
+              <span>{speciesDisplay(compareLeft.plant_identification)} · {compareLeft.health_status}</span>
             </div>
 
             <div className="compare-side">
@@ -1371,7 +1164,7 @@ function MonitoringHistoryPage({ plants, onSelectAnalysis }: any) {
                     ))}
                   </select>
                   <img src={imgUrl(compareRight.image)} alt="Scan Right" style={{ marginTop: '10px' }} />
-                  <span>{compareRight.plant_identification} · {compareRight.health_status}</span>
+                  <span>{speciesDisplay(compareRight.plant_identification)} · {compareRight.health_status}</span>
                 </>
               ) : (
                 <div style={{ height: '220px', display: 'grid', placeItems: 'center', background: '#f5f7f3', borderRadius: '8px', color: '#88998d' }}>
@@ -1547,7 +1340,7 @@ function PlantAIAssistantPage({ plants, selectedPlant, activeAnalysis, setToast 
                 <option value="">General Botanical Knowledge</option>
                 {plants.map((p: Plant) => (
                   <option key={p.id} value={p.id}>
-                    {p.name} ({p.species})
+                    {p.name} ({speciesDisplay(p.species)})
                   </option>
                 ))}
               </select>
@@ -1801,7 +1594,6 @@ function SettingsPage({ onSave, setToast }: any) {
   const [settingsData, setSettingsData] = useState<any>(null);
   const [streamUrl, setStreamUrl] = useState('http://10.105.234.29:81/stream');
   const [snapshotUrl, setSnapshotUrl] = useState('http://10.105.234.29/capture');
-  const [testResult, setTestResult] = useState<any>(null);
   const [testing, setTesting] = useState(false);
 
   useEffect(() => {
@@ -1814,13 +1606,11 @@ function SettingsPage({ onSave, setToast }: any) {
 
   const handleTestCamera = async () => {
     setTesting(true);
-    setTestResult(null);
     try {
       const res = await api(`/api/settings/test-camera?url=${encodeURIComponent(streamUrl)}`, { method: 'POST' });
-      setTestResult(res);
       setToast(res.connected ? 'Camera endpoint responded!' : 'Camera endpoint unreachable.');
     } catch (e: any) {
-      setTestResult({ connected: false, message: e.message });
+      setToast('Camera endpoint unreachable.');
     } finally {
       setTesting(false);
     }
@@ -1854,7 +1644,7 @@ function SettingsPage({ onSave, setToast }: any) {
               onChange={(e) => setStreamUrl(e.target.value)}
               placeholder="http://10.105.234.29:81/stream"
             />
-            <small>Used for continuous live preview in the dashboard.</small>
+            <small>For this ESP32, use http://10.105.234.29:81/stream. A camera root URL is converted automatically when saved.</small>
           </label>
 
           <label>
@@ -1864,21 +1654,31 @@ function SettingsPage({ onSave, setToast }: any) {
               onChange={(e) => setSnapshotUrl(e.target.value)}
               placeholder="http://10.105.234.29/capture"
             />
-            <small>Endpoint returning a single high-res JPEG frame on demand.</small>
+            <small>For this ESP32, use http://10.105.234.29/capture. A camera root URL is converted automatically when saved.</small>
           </label>
 
           <div className="settings-actions">
-            <button className="btn primary" onClick={onSave}>Save URLs</button>
+            <button
+              className="btn primary"
+              onClick={async () => {
+                try {
+                  await api('/api/settings/camera', {
+                    method: 'POST',
+                    body: JSON.stringify({ stream_url: streamUrl, snapshot_url: snapshotUrl }),
+                  });
+                  onSave();
+                } catch (e: any) {
+                  setToast(e.message);
+                }
+              }}
+            >
+              Save URLs
+            </button>
             <button className="btn secondary" onClick={handleTestCamera} disabled={testing}>
               <Wifi size={14} className={testing ? 'spinner' : ''} /> Test Connection
             </button>
           </div>
 
-          {testResult && (
-            <div className={`connection-note ${testResult.connected ? 'good' : ''}`}>
-              <i /> {testResult.message}
-            </div>
-          )}
         </div>
 
         {/* AI & Services Card */}
@@ -1887,7 +1687,15 @@ function SettingsPage({ onSave, setToast }: any) {
             <div className="settings-icon soft-purple"><Stethoscope /></div>
             <div>
               <h3>AI Diagnostics &amp; LLM</h3>
-              <p>Environment configuration read securely from <code>backend/.env</code>.</p>
+              <p>PlantNet identifies species, Plant.id assesses visible plant health, and Groq powers the assistant and reports.</p>
+            </div>
+          </div>
+
+          <div className="service-row">
+            <div className="service-mark"><Leaf size={16} /></div>
+            <div>
+              <b>PlantNet Species Identification</b>
+              <span>Species identification runs securely through the backend</span>
             </div>
           </div>
 
@@ -1895,31 +1703,16 @@ function SettingsPage({ onSave, setToast }: any) {
             <div className="service-mark"><Leaf size={16} /></div>
             <div>
               <b>Plant.id Health Assessment</b>
-              <span>External Phytopathological Cloud API</span>
+              <span>Health assessment runs securely through the backend</span>
             </div>
-            <span className={`service-state ${settingsData?.diagnosis_configured ? 'on' : ''}`}>
-              <i /> {settingsData?.diagnosis_configured ? 'Active' : 'Using Local CV Engine'}
-            </span>
           </div>
 
           <div className="service-row">
             <div className="service-mark groq"><MessageCircle size={16} /></div>
             <div>
-              <b>Groq Chat LLM ({settingsData?.chat_model || 'llama-3.3-70b'})</b>
-              <span>Conversational Assistant Provider</span>
+              <b>Groq Assistant</b>
+              <span>Chat and report generation run securely through the backend</span>
             </div>
-            <span className={`service-state ${settingsData?.chat_configured ? 'on' : ''}`}>
-              <i /> {settingsData?.chat_configured ? 'Configured' : 'Using Local Botanical Agent'}
-            </span>
-          </div>
-
-          <div className="service-row">
-            <div className="service-mark"><Activity size={16} /></div>
-            <div>
-              <b>FloraBOT Computer Vision Engine</b>
-              <span>Local Chlorosis, Wilting &amp; Leaf Geometry Analysis</span>
-            </div>
-            <span className="service-state on"><i /> Always Active</span>
           </div>
         </div>
       </div>
@@ -1948,7 +1741,7 @@ function PlantProfileView({ plant, onBack, onScan, onAnalysisClick, onGenerateRe
         <div className="profile-info">
           <div className="eyebrow">PLANT SPECIMEN · #{String(plant.id).padStart(3, '0')}</div>
           <h1>{plant.name}</h1>
-          <p>{plant.species} · {plant.category}</p>
+          <p>{speciesDisplay(plant.species)} · {plant.category}</p>
           <div className="profile-tags">
             <span className={`badge ${healthBadgeClass(plant.health_status)}`}>{plant.health_status}</span>
             <span>Container: {plant.pot_size_cm} cm</span>
@@ -2119,39 +1912,65 @@ function RegisterPlantModal({ onClose, onSaved }: any) {
 }
 
 function AnalysisResultModal({ analysis, plant, onClose, onDownloadPdf, onAskAssistant }: any) {
+  const [showDetections, setShowDetections] = useState(true);
+  const [showOriginal, setShowOriginal] = useState(false);
+  const originalImage = analysis.original_image || analysis.image;
+  const hasBoxes = Boolean(analysis.detections?.length);
+  const speciesLabel = speciesDisplay(analysis.plant_identification);
+  const reliableMatches = (analysis.identification_candidates || []).filter((c: any) => c.score >= 0.15);
+  const needsClearerImage = analysis.health_status?.toLowerCase().includes('image needs');
+  const findingsSummary = hasBoxes
+    ? (analysis.symptoms || 'The image analysis returned labeled regions for review.')
+    : needsClearerImage
+      ? (analysis.symptoms || 'Retake a clear, well-lit close-up of the plant.')
+      : 'No supported disease pattern was identified. This scan cannot confirm that the plant is healthy.';
+  const diagnosisScore = analysis.disease_confidence ?? analysis.confidence;
+  const scoreLabel = analysis.disease_confidence != null ? 'Disease confidence' : analysis.provider_reference === 'plant_id_health_assessment' && analysis.disease_detected === 'no' ? 'Plant health score' : 'Diagnostic confidence';
+  const conditionLabel = analysis.disease_name || (analysis.disease_detected === 'no' ? analysis.health_status : 'Inconclusive');
+  const displayedImage = showOriginal || (hasBoxes && !showDetections) ? originalImage : (analysis.annotated_image || originalImage);
   return (
     <div className="modal-backdrop result-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
       <div className="result-modal">
         <div className="result-top">
           <button className="icon-btn result-close" onClick={onClose}><X /></button>
           <div className={`result-emblem ${healthBadgeClass(analysis.health_status)}`}>
-            {analysis.health_status === 'Healthy' ? <ShieldCheck size={24} /> : <AlertTriangle size={24} />}
+            {analysis.health_status.toLowerCase().includes('healthy') ? <ShieldCheck size={24} /> : <AlertTriangle size={24} />}
           </div>
           <div className="eyebrow">FLORABOT DIAGNOSTIC REPORT</div>
           <h2>{analysis.health_status}</h2>
-          <p>{analysis.disease_name ? `Visible signs consistent with ${analysis.disease_name}.` : 'Uniform healthy vegetative pigmentation observed.'}</p>
+          <p>{findingsSummary}</p>
           <div className={`badge ${healthBadgeClass(analysis.health_status)}`}>
-            Confidence: {analysis.confidence ? `${Math.round(analysis.confidence * 100)}%` : 'Calibrated Heuristic'}
+            {scoreLabel}: {diagnosisScore != null ? `${Math.round(diagnosisScore * 100)}%` : 'Not provided by the active model'}
           </div>
         </div>
 
         <div className="result-body">
-          <div className="result-image">
-            <img src={imgUrl(analysis.image)} alt="Analyzed specimen" />
-            <span>ANALYZED SPECIMEN</span>
+          <div className="result-image" style={{ height: 250 }}>
+            <img src={imgUrl(displayedImage)} alt={showOriginal ? "Original captured plant" : "Analyzed specimen with model detections"} />
+            {hasBoxes && showDetections && !showOriginal && !analysis.annotated_image && <svg className="detection-overlay" viewBox={`0 0 ${analysis.detections[0].image_width} ${analysis.detections[0].image_height}`} preserveAspectRatio="xMidYMid meet" aria-label="Detected object regions">
+              {analysis.detections.map((d: any, i: number) => <g key={d.id || i}><title>{d.detection_type || "Model-labeled object region"}: {d.label} ({Math.round(d.confidence*100)}%)</title><rect x={d.x1 * d.image_width} y={d.y1 * d.image_height} width={(d.x2-d.x1)*d.image_width} height={(d.y2-d.y1)*d.image_height} fill="none" stroke="#ffca55" strokeWidth={Math.max(3,d.image_width*.004)} /><text x={d.x1*d.image_width} y={Math.max(24,d.y1*d.image_height-5)} fill="#fff" stroke="#25372c" strokeWidth=".8" paintOrder="stroke" fontSize={Math.max(16,d.image_width*.018)}>{d.label} {Math.round(d.confidence*100)}%</text></g>)}
+            </svg>}
+            <span>{hasBoxes && showDetections && !showOriginal ? 'MODEL OBJECT BOXES' : 'ORIGINAL IMAGE'}</span>
           </div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', margin: '8px 0', fontSize: 10, color: '#76867a' }}>
+            <span>{hasBoxes ? `${analysis.detections.length} model-labeled object box(es) | ${analysis.detection_model?.model_name || analysis.detections[0].source || analysis.provider_engine}. Boxes do not isolate individual lesions.` : needsClearerImage ? 'The image needs a clearer view of the plant.' : 'No confident disease signs were identified. This does not confirm that the plant is healthy.'}</span>
+            <span>{hasBoxes && <button className="text-link" onClick={() => setShowDetections(!showDetections)}>{showDetections ? 'Hide' : 'Show'} boxes</button>} <button className="text-link" onClick={() => setShowOriginal(!showOriginal)}>{showOriginal ? 'Show annotated image' : 'Original image'}</button></span>
+          </div>
+          {speciesLabel === 'Species not identified' && <p style={{ margin: '7px 0 12px', fontSize: 10, lineHeight: 1.5, color: '#748579' }}>No reliable species match came from this image. Check PlantNet in Settings and use a clear, close photo of the leaves or flowers.</p>}
+          {reliableMatches.length > 1 && <p style={{ fontSize: 10, color: '#6d7d70' }}>Other possible matches: {reliableMatches.slice(1).map((c: any) => `${c.scientific_name} (${Math.round(c.score*100)}%)`).join(', ')}</p>}
 
           <div className="result-facts">
-            <div><span>Species</span><b>{analysis.plant_identification}</b></div>
-            <div><span>Identified Condition</span><b>{analysis.disease_name || 'None Identified'}</b></div>
-            <div><span>Stress Posture</span><b>{analysis.stress_status}</b></div>
+            <div><span>Species</span><b>{speciesLabel}{analysis.plant_confidence != null ? ` (${Math.round(analysis.plant_confidence * 100)}% match)` : ''}</b></div>
+            <div><span>Identified Condition</span><b>{conditionLabel}</b></div>
+            <div><span>Stress Posture</span><b>{!analysis.stress_status || analysis.stress_status.toLowerCase() === 'unknown' ? 'Not assessed' : analysis.stress_status}</b></div>
             <div><span>Watering Advice</span><b>{analysis.watering_quantity_ml ? `${analysis.watering_quantity_ml} ml Target` : analysis.watering_status}</b></div>
           </div>
+
 
           <div className="result-copy">
             <div>
               <h4>Observed Findings</h4>
-              <p>{analysis.symptoms || 'Normal leaf pigmentation.'}</p>
+              <p>{findingsSummary}</p>
             </div>
             <div>
               <h4>Hydration Reasoning</h4>

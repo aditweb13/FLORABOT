@@ -1,0 +1,59 @@
+name: FloraBOT CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  frontend-build:
+    name: Frontend Build & Typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build frontend and typecheck
+        run: npm run build
+
+  backend-test:
+    name: Backend Test & Verification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: 'backend/requirements.txt'
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+
+      - name: Run Phase 1 to Phase 9 verification tests
+        run: |
+          cd backend
+          python test_phase1.py
+          python test_phase2.py
+          python test_phase3.py
+          python test_phase4.py
+          python test_phase5.py
+          python test_phase6.py
+          python test_phase7.py
+          python test_phase8_e2e.py
+          python test_phase9.py

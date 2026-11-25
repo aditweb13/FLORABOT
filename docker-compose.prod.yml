@@ -1,0 +1,74 @@
+# ==============================================================================
+# FloraBOT Production Multi-Container Docker Compose Stack
+# Components:
+# 1. db: PostgreSQL 15 with automated healthchecks and persistent volume
+# 2. backend: FastAPI service running under Gunicorn/Uvicorn workers
+# 3. nginx: Production reverse proxy with SSL termination and rate limiting
+# ==============================================================================
+
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: florabot-postgres-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: florabot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-florabot_secure_password_2026}
+      POSTGRES_DB: florabot_db
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U florabot -d florabot_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - florabot-internal
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: florabot-backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./backend/data:/app/data
+    env_file:
+      - ./backend/.env
+    environment:
+      - DATABASE_URL=postgresql://florabot:${POSTGRES_PASSWORD:-florabot_secure_password_2026}@db:5432/florabot_db
+      - UPLOAD_DIR=./data/uploads
+      - REPORT_DIR=./data/reports
+      - ENABLE_AUTH=true
+    networks:
+      - florabot-internal
+
+  nginx:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: florabot-nginx-proxy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/florabot.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+    depends_on:
+      - backend
+    networks:
+      - florabot-internal
+
+volumes:
+  pgdata:
+    driver: local
+
+networks:
+  florabot-internal:
+    driver: bridge

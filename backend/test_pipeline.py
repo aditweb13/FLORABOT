@@ -25,23 +25,33 @@ plant = r.json()
 pid = plant['id']
 print(f'   Created: {plant["name"]} (id={pid})')
 
-# 2. Load a real JPEG that already passed validation
-img_path = pathlib.Path('data/uploads/04c4b8e151f9412e991f8156e83fd118.jpg')
+# 2. Load a real JPEG already stored by FloraBOT (the previous hard-coded
+# fixture was no longer present in the development upload directory).
+img_path = pathlib.Path('data/uploads/d15967fc05814732ab48e3c70932bddf.jpg')
 if not img_path.exists():
-    print(f'   SKIP: Image file not found')
+    img_path = next(pathlib.Path('data/uploads').glob('*.jpg'), None)
+if img_path is None:
+    raise SystemExit('No existing JPEG capture is available for the pipeline test.')
 else:
     jpeg_bytes = img_path.read_bytes()
-    print(f'2. Testing /api/camera/upload with {len(jpeg_bytes):,} byte JPEG...')
+    print(f'2. Testing automatic discovery without plant_id using {len(jpeg_bytes):,} byte JPEG...')
     r = client.post('/api/camera/upload',
         files={'image': ('plant.jpg', io.BytesIO(jpeg_bytes), 'image/jpeg')},
-        data={'device_id': 'esp32-cam-01', 'plant_id': str(pid)}
+        data={'device_id': 'esp32-cam-01'}
     )
     print(f'   Status: {r.status_code}')
+    if r.status_code != 200:
+        raise AssertionError(f'Plantless camera upload failed: {r.text[:500]}')
     if r.status_code == 200:
         cam = r.json()
         print(f'   Result: status={cam.get("status")}, analysis_id={cam.get("analysis_id")}')
         print(f'   Health: {cam.get("health_status")}, Provider: {cam.get("provider")}')
         aid = cam.get('analysis_id')
+        assert cam.get('plant_id'), 'Automatic discovery did not return a plant record.'
+        analysis = client.get(f'/api/analyses/{aid}').json()
+        assert isinstance(analysis.get('detections'), list)
+        assert not analysis['detections'], 'Local detector results should no longer be produced.'
+        print('   Verified analysis uses hosted providers without local model detections.')
     else:
         print(f'   Error: {r.text[:300]}')
         aid = None
@@ -53,6 +63,7 @@ else:
         headers={'Content-Type': 'image/jpeg', 'X-Plant-Id': str(pid)}
     )
     print(f'   Status: {r2.status_code}')
+    assert r2.status_code == 200, f'Raw camera image failed: {r2.text[:500]}'
     if r2.status_code == 200:
         r2d = r2.json()
         print(f'   Result: {r2d.get("status")}, analysis_id={r2d.get("analysis_id")}')

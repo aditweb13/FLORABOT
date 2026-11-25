@@ -10,6 +10,7 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RLImage, Table, TableStyle, KeepTogether
 from .config import settings
+from .vision_engine import analyze_plant_image
 
 def ensure_dirs():
     Path(settings.upload_dir).mkdir(parents=True, exist_ok=True)
@@ -28,33 +29,7 @@ def save_image(data: bytes, filename: str) -> str:
         raise ValueError("Please upload a valid JPG, PNG, or WEBP image.") from exc
 
 def analyze_plant(path: str):
-    if not settings.plant_id_api_key:
-        raise RuntimeError("Plant diagnosis is not configured. Add PLANT_ID_API_KEY to backend/.env.")
-    image = base64.b64encode(Path(path).read_bytes()).decode("ascii")
-    with httpx.Client(timeout=45) as client:
-        response = client.post(settings.plant_id_api_url, headers={"Api-Key": settings.plant_id_api_key, "Content-Type": "application/json"}, json={"images": [f"data:image/jpeg;base64,{image}"], "health": "all", "similar_images": True})
-    if response.status_code == 429: raise RuntimeError("Plant diagnosis is busy. Please wait a moment and try again.")
-    if response.status_code in (401, 403): raise RuntimeError("Plant diagnosis credentials were rejected. Check PLANT_ID_API_KEY.")
-    response.raise_for_status()
-    raw = response.json()
-    result = raw.get("result", {})
-    health = result.get("is_healthy", {}).get("binary")
-    diseases = result.get("disease", {}).get("suggestions", [])
-    species = result.get("classification", {}).get("suggestions", [])
-    top_species = species[0] if species else {}
-    top_disease = diseases[0] if diseases else {}
-    confidence = top_disease.get("probability") if top_disease else (top_species.get("probability") if top_species else None)
-    uncertain = health is None and not diseases
-    detected = "yes" if diseases and top_disease.get("probability", 0) >= 0.25 else ("no" if health is True else "uncertain")
-    status = "Disease Detected" if detected == "yes" else ("Healthy" if detected == "no" else "Inconclusive")
-    if detected == "yes" and top_disease.get("probability", 0) < .65: status = "Needs Attention"
-    details = top_disease.get("details") or {}
-    symptoms = details.get("description") or ("The image appears healthy." if detected == "no" else "The image result is uncertain; capture a clear, well-lit close-up of the affected leaf.")
-    care = details.get("treatment") or {}
-    recs = care.get("chemical") or care.get("biological") or care.get("prevention") or ["Remove badly affected leaves with clean tools.", "Avoid wetting foliage and improve airflow.", "Recheck the plant in 5–7 days."]
-    if isinstance(recs, list): recs = "\n".join(str(x.get("name", x)) if isinstance(x, dict) else str(x) for x in recs)
-    prevention = details.get("cause") or "Keep leaves dry, provide suitable light and airflow, and disinfect tools between plants."
-    return {"raw": raw, "plant_identification": top_species.get("name", "Unknown"), "disease_detected": detected, "disease_name": top_disease.get("name", "") if detected == "yes" else "", "severity": details.get("severity", "") or "", "health_status": status, "confidence": confidence, "symptoms": symptoms, "recommendations": str(recs), "prevention": str(prevention), "provider_reference": str(raw.get("access_token", ""))}
+    return analyze_plant_image(path)
 
 def chat_reply(messages, context=""):
     if not settings.groq_api_key: raise RuntimeError("Plant chat is not configured. Add GROQ_API_KEY to backend/.env.")

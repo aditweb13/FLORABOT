@@ -125,9 +125,11 @@ def build_pdf_report(
     story.append(Paragraph("B. Monitored Leaf Observation & Health Status", h2_style))
     
     img_element = None
-    if os.path.exists(analysis.image):
+    annotated_path = getattr(analysis, "annotated_image_path", None)
+    display_path = annotated_path if annotated_path and os.path.exists(annotated_path) else analysis.image
+    if os.path.exists(display_path):
         try:
-            img_element = RLImage(analysis.image, width=2.6*inch, height=1.9*inch, kind="proportional")
+            img_element = RLImage(display_path, width=2.6*inch, height=1.9*inch, kind="proportional")
         except Exception:
             img_element = Paragraph("[Analyzed Leaf Image]", meta_style)
 
@@ -149,6 +151,14 @@ def build_pdf_report(
     ]))
     story.append(t_health)
     story.append(Spacer(1, 10))
+    if annotated_path and os.path.exists(annotated_path) and os.path.exists(analysis.image):
+        story.append(Paragraph("Original capture (annotations are shown in the analysis image above)", meta_style))
+        try:
+            original_element = RLImage(analysis.image, width=2.6*inch, height=1.9*inch, kind="proportional")
+            story.append(original_element)
+            story.append(Spacer(1, 8))
+        except Exception:
+            pass
 
     # 4. Watering Recommendation Section
     story.append(Paragraph("C. Intelligent Watering Recommendation", h2_style))
