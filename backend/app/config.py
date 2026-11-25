@@ -1,6 +1,9 @@
 from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+BACKEND_DIR = Path(__file__).resolve().parent.parent
+ROOT_DIR = BACKEND_DIR.parent
+
 class Settings(BaseSettings):
     database_url: str = "sqlite:///./florabot.db"
     upload_dir: str = "./data/uploads"
@@ -17,7 +20,7 @@ class Settings(BaseSettings):
     monitoring_interval_seconds: int = 60
     min_confidence_threshold: float = 0.35
     high_confidence_threshold: float = 0.70
-    cors_origins: str = "http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173"
+    cors_origins: str = "http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173,http://localhost:5190,http://127.0.0.1:5190"
     
     # Security, JWT & IoT API Authentication
     jwt_secret_key: str = "florabot-production-jwt-secret-key-replace-with-env-2026"
@@ -28,6 +31,10 @@ class Settings(BaseSettings):
     rate_limit_per_minute: int = 60
     rate_limit_auth_per_minute: int = 10
     
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=(str(BACKEND_DIR / ".env"), ".env"),
+        env_file_encoding="utf-8",
+        extra="ignore"
+    )
 
 settings = Settings()
